@@ -1,0 +1,68 @@
+trigger:
+  branches: [ main ]
+pr:
+  branches: [ main ]
+
+# ===== 可按需修改的变量 =====
+variables:
+  dockerHubRepo: 'rayrayye/timeapp-api-new' # 你的 Docker Hub 仓库
+  dockerfilePath: 'Dockerfile'              # API 的 Dockerfile 路径（如有不同请修改）
+  buildContext: '.'                         # 构建上下文（API 仓库根）
+  k8sServiceConnection: 'k8s-sc'            # 你创建的 K8s Service Connection 名称
+  namespace: 'timeapp'                      # K8s 命名空间
+  deployment: 'web-api'                     # K8s Deployment 名
+  container: 'api'                          # Deployment 内的容器名
+
+  # 版本号（从 1.0 开始、自动递增 patch）
+  major: '1'
+  counterKey: 'api-1'                       # api 独立计数器 key
+  patch: $[ counter(variables['counterKey'], 0) ]
+  version: '$(major).$(patch)'
+
+stages:
+- stage: Build
+  displayName: Build & Push API Image
+  jobs:
+  - job: build
+    steps:
+    - task: Docker@2
+      displayName: Login Docker Hub
+      inputs:
+        command: login
+        containerRegistry: 'toDockerHub'   # 你之前建好的 Docker Hub service connection 名
+
+    - task: Docker@2
+      displayName: Build+Push api:$(version)
+      inputs:
+        command: buildAndPush
+        repository: '$(dockerHubRepo)'
+        Dockerfile: '$(dockerfilePath)'
+        buildContext: '$(buildContext)'
+        tags: |
+          $(version)
+
+- stage: Deploy
+  displayName: Deploy API to K8s
+  dependsOn: Build
+  jobs:
+  - job: deploy
+    steps:
+    - task: Kubernetes@1
+      displayName: Set image (api → $(version))
+      inputs:
+        connectionType: 'Kubernetes Service Connection'
+        kubernetesServiceEndpoint: '$(k8sServiceConnection)'
+        namespace: '$(namespace)'
+        command: 'set'
+        arguments: >
+          image deployment/$(deployment)
+          $(container)=docker.io/$(dockerHubRepo):$(version)
+
+    - task: Kubernetes@1
+      displayName: Wait rollout (api)
+      inputs:
+        connectionType: 'Kubernetes Service Connection'
+        kubernetesServiceEndpoint: '$(k8sServiceConnection)'
+        namespace: '$(namespace)'
+        command: 'rollout'
+        arguments: 'status deployment/$(deployment) --timeout=120s'
