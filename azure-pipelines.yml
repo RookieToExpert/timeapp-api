@@ -1,35 +1,58 @@
+# ==== 触发器 ====
 trigger:
-  branches: [ main ]
+  branches:
+    include:
+    - main
 pr:
-  branches: [ main ]
+  branches:
+    include:
+    - main
 
-# ===== 可按需修改的变量 =====
+# ==== 手动运行时可修改的入参（可选） ====
+parameters:
+- name: major               # 主版本（点击“Run pipeline”可改）
+  type: string
+  default: '1'
+- name: version             # 可选：手动指定完整版本（例如 2.7）；若留空则走自动计数
+  type: string
+  default: ''
+
+# ==== 变量 ====
 variables:
-  dockerHubRepo: 'rayrayye/timeapp-api-new' # 你的 Docker Hub 仓库
-  dockerfilePath: 'Dockerfile'              # API 的 Dockerfile 路径（如有不同请修改）
-  buildContext: '.'                         # 构建上下文（API 仓库根）
-  k8sServiceConnection: 'k8s-sc'            # 你创建的 K8s Service Connection 名称
-  namespace: 'timeapp'                      # K8s 命名空间
-  deployment: 'web-api'                     # K8s Deployment 名
-  container: 'api'                          # Deployment 内的容器名
+  # 镜像、路径、K8s 对象
+  dockerHubRepo: 'rayrayye/timeapp-api-new'
+  dockerfilePath: 'Dockerfile'          # API 仓库里是大写 D
+  buildContext: '.'
+  k8sServiceConnection: 'k8s-sc'
+  namespace: 'timeapp'
+  deployment: 'web-api'
+  container: 'api'
 
-  # 版本号（从 1.0 开始、自动递增 patch）
-  major: '1'
-  counterKey: 'api-1'                       # api 独立计数器 key
+  # 版本规则：默认【major + 自动 patch 递增】；也支持手动 version 覆盖
+  major: ${{ parameters.major }}
+  counterKey: 'api-${{ parameters.major }}'     # 每个 major 单独计数
   patch: $[ counter(variables['counterKey'], 0) ]
-  version: '$(major).$(patch)'
 
+  # 如果手动传入 version 就用它，否则用 major.patch
+  ${{ if ne(parameters.version, '') }}:
+    version: ${{ parameters.version }}
+  ${{ if eq(parameters.version, '') }}:
+    version: '$(major).$(patch)'
+
+# ==== 流水线 ====
 stages:
 - stage: Build
   displayName: Build & Push API Image
   jobs:
   - job: build
+    pool:
+      vmImage: 'ubuntu-latest'
     steps:
     - task: Docker@2
       displayName: Login Docker Hub
       inputs:
         command: login
-        containerRegistry: 'toDockerHub'   # 你之前建好的 Docker Hub service connection 名
+        containerRegistry: 'toDockerHub'   # 你的 Docker Hub service connection 名
 
     - task: Docker@2
       displayName: Build+Push api:$(version)
@@ -48,7 +71,7 @@ stages:
   - job: deploy
     steps:
     - task: Kubernetes@1
-      displayName: Set image (api → $(version))
+      displayName: Set image (web-api → $(version))
       inputs:
         connectionType: 'Kubernetes Service Connection'
         kubernetesServiceEndpoint: '$(k8sServiceConnection)'
@@ -59,7 +82,7 @@ stages:
           $(container)=docker.io/$(dockerHubRepo):$(version)
 
     - task: Kubernetes@1
-      displayName: Wait rollout (api)
+      displayName: Wait rollout (web-api)
       inputs:
         connectionType: 'Kubernetes Service Connection'
         kubernetesServiceEndpoint: '$(k8sServiceConnection)'
