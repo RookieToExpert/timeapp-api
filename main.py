@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---- 日志 ----
-log = logging.getLogger("timeapp")
+log = logging.getLogger("timeapp")  
 logging.basicConfig(level=logging.INFO)
 
 # ---- 配置（通过环境变量）----
