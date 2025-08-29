@@ -2,17 +2,14 @@ trigger: { branches: { include: [ main ] } }
 pr:       { branches: { include: [ main ] } }
 
 variables:
-  # 镜像（api）
+  # 镜像仓库（注意是 -new）
   apiRepo: 'docker.io/rayrayye/timeapp-api-new'
   dockerfilePath: 'Dockerfile'
   buildContext: '.'
 
-  # 配置仓（GitHub）
   githubOrgRepo: 'RookieToExpert/az305'
   configPath: 'kubernetes&docker/timeapp-config/overlays/prod'
-  configBranchPrefix: 'bump-api'
 
-  # 版本号（与 web 解耦的计数器）
   major: '1'
   counterKey: 'api-1'
   patch: $[ counter(variables['counterKey'], 0) ]
@@ -40,48 +37,47 @@ stages:
           $(version)
 
 - stage: ConfigPR
-  displayName: 'Create PR to bump api tag (GitOps)'
+  displayName: Create PR (bump api tag)
   dependsOn: Build
   jobs:
   - job: pr
     pool: { vmImage: 'ubuntu-latest' }
     steps:
+    - checkout: none
+
     - script: |
-        set -eux
+        set -euo pipefail
         curl -L https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o /usr/local/bin/yq
         chmod +x /usr/local/bin/yq
-        sudo apt-get update && sudo apt-get install -y gh
-      displayName: Install yq & gh
+      displayName: Install yq
 
     - script: |
-        set -eux
-        export GH_TOKEN="$(GITHUB_TOKEN)"
+        set -euo pipefail
+
         git config --global user.name  "ado-bot"
         git config --global user.email "ado-bot@example.com"
+        git config --global --add safe.directory /home/vsts/work
 
-        git clone "https://github.com/$(githubOrgRepo).git" configrepo
+        GIT_URL="https://$(GITHUB_TOKEN)@github.com/$(githubOrgRepo).git"
+        git clone "$GIT_URL" configrepo
         cd configrepo
 
-        BR="$(configBranchPrefix)-$(version)-$(Build.BuildId)"
-        git checkout -b "$BR"
+        BR="bump-api-$(version)-$(Build.BuildId)"
+        git switch -c "$BR"
 
         FILE="$(configPath)/kustomization.yaml"
-        export IMG_NAME="$(apiRepo)"
-        export VERSION="$(version)"
+        IMG_NAME="$(apiRepo)"
+        VERSION="$(version)"
         yq -i '(.images[] | select(.name == env(IMG_NAME))).newTag = env(VERSION)' "$FILE"
-
-        echo "After change:" && yq '.images' "$FILE"
 
         git add "$FILE"
         git commit -m "chore(api): bump to $(version)"
         git push -u origin "$BR"
 
-        gh pr create \
-          --repo "$(githubOrgRepo)" \
-          --base main --head "$BR" \
-          --title "Bump api to $(version)" \
-          --body "Update api image tag to $(version) for GitOps" \
-          --label "gitops"
-      displayName: Bump api tag & open PR
+        curl -sS -X POST "https://api.github.com/repos/$(githubOrgRepo)/pulls" \
+          -H "Authorization: token $(GITHUB_TOKEN)" \
+          -H "Accept: application/vnd.github+json" \
+          -d "{\"title\":\"Bump api to $(version)\",\"body\":\"Update api image tag to $(version) for GitOps\",\"head\":\"$BR\",\"base\":\"main\",\"maintainer_can_modify\":true}"
+      displayName: 'Bump api tag & open PR'
       env:
         GITHUB_TOKEN: $(GITHUB_TOKEN)
