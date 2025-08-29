@@ -1,9 +1,9 @@
+# azure-pipelines-api.yml
 trigger: { branches: { include: [ main ] } }
 pr:       { branches: { include: [ main ] } }
 
 variables:
-  # 镜像仓库（注意是 -new）
-  apiRepo: 'docker.io/rayrayye/timeapp-api-new'
+  apiRepo: 'docker.io/rayrayye/timeapp-api-new'   # 注意 -new
   dockerfilePath: 'Dockerfile'
   buildContext: '.'
 
@@ -25,7 +25,6 @@ stages:
     - task: Docker@2
       displayName: Login Docker Hub
       inputs: { command: login, containerRegistry: 'toDockerHub' }
-
     - task: Docker@2
       displayName: Build+Push api:$(version)
       inputs:
@@ -49,35 +48,44 @@ stages:
         set -euo pipefail
         curl -L https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o /usr/local/bin/yq
         chmod +x /usr/local/bin/yq
-      displayName: Install yq
+        sudo apt-get update -y
+        sudo apt-get install -y jq
+      displayName: Install yq & jq
 
     - script: |
         set -euo pipefail
 
         git config --global user.name  "ado-bot"
         git config --global user.email "ado-bot@example.com"
-        git config --global --add safe.directory /home/vsts/work
 
-        GIT_URL="https://$(GITHUB_TOKEN)@github.com/$(githubOrgRepo).git"
+        GIT_URL="https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
         git clone "$GIT_URL" configrepo
         cd configrepo
 
-        BR="bump-api-$(version)-$(Build.BuildId)"
+        BR="bump-api-${VERSION}-${BUILD_ID}"
         git switch -c "$BR"
 
-        FILE="$(configPath)/kustomization.yaml"
-        IMG_NAME="$(apiRepo)"
-        VERSION="$(version)"
+        FILE="${CONFIG_PATH}/kustomization.yaml"
         yq -i '(.images[] | select(.name == env(IMG_NAME))).newTag = env(VERSION)' "$FILE"
 
         git add "$FILE"
-        git commit -m "chore(api): bump to $(version)"
+        git commit -m "chore(api): bump to ${VERSION}"
         git push -u origin "$BR"
 
-        curl -sS -X POST "https://api.github.com/repos/$(githubOrgRepo)/pulls" \
-          -H "Authorization: token $(GITHUB_TOKEN)" \
+        RESP=$(curl -sS -X POST "https://api.github.com/repos/${GITHUB_REPO}/pulls" \
+          -H "Authorization: token ${GITHUB_TOKEN}" \
           -H "Accept: application/vnd.github+json" \
-          -d "{\"title\":\"Bump api to $(version)\",\"body\":\"Update api image tag to $(version) for GitOps\",\"head\":\"$BR\",\"base\":\"main\",\"maintainer_can_modify\":true}"
+          -d "{\"title\":\"Bump api to ${VERSION}\",\"body\":\"Update api image tag to ${VERSION} for GitOps\",\"head\":\"$BR\",\"base\":\"main\",\"maintainer_can_modify\":true}")
+        echo "$RESP" | jq -r '.html_url'
+
+        # （可选）自动合并
+        # PR_NUM=$(echo "$RESP" | jq -r '.number')
+        # curl -sS -X PUT "https://api.github.com/repos/${GITHUB_REPO}/pulls/${PR_NUM}/merge" -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -d '{"merge_method":"merge"}'
       displayName: 'Bump api tag & open PR'
       env:
         GITHUB_TOKEN: $(GITHUB_TOKEN)
+        GITHUB_REPO: $(githubOrgRepo)
+        CONFIG_PATH: '$(configPath)'
+        IMG_NAME: '$(apiRepo)'                  # ← 与 kustomization.yaml 的 name 完全一致
+        VERSION: $(version)
+        BUILD_ID: $(Build.BuildId)
