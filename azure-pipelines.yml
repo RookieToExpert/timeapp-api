@@ -1,30 +1,36 @@
 trigger:
   branches:
-    include:
-      - main
+    include: [ main ]
 
 pr:
   branches:
-    include:
-      - main
+    include: [ main ]
 
 variables:
-  # ---- 镜像 & 版本 ----
-  dockerHubRepo: 'rayrayye/timeapp-api-new'
-  dockerfilePath: 'Dockerfile'
-  buildContext: '.'
+- name: dockerHubRepo
+  value: 'rayrayye/timeapp-api-new'          # ←改成你的 API 仓库
+- name: dockerfilePath
+  value: 'Dockerfile'
+- name: buildContext
+  value: '.'
 
-  major: '1'
-  counterKey: 'api-1'
-  VERSION: '$(major).$[ counter(variables[''counterKey''], 0) ]'
+# 版本号：纯 runtime 表达式（不要混用 $(macro)）
+- name: major
+  value: '1'
+- name: counterKey
+  value: 'api-1'
+- name: VERSION
+  value: $[ format('{0}.{1}', variables['major'], counter(variables['counterKey'], 0)) ]
 
-  # ---- GitOps 仓库 & 目标文件（注意含 &）----
-  GITOPS_REPO: 'RookieToExpert/az305'
-  CONFIG_DIR: 'kubernetes&docker/timeapp-config/overlays/prod'
-  IMG_NAME: 'docker.io/rayrayye/timeapp-api-new'  # 必须与 kustomization.yaml 中 .images[].newName 完全一致
+# GitOps 目标（注意含 &）
+- name: GITOPS_REPO
+  value: 'RookieToExpert/az305'              # ←改成你的 GitOps 仓库
+- name: CONFIG_DIR
+  value: 'kubernetes&docker/timeapp-config/overlays/prod'
+- name: IMG_NAME
+  value: 'docker.io/rayrayye/timeapp-api-new' # ←与 kustomization.yaml 中 newName 完全一致
 
 stages:
-# ------------------- Build & Push -------------------
 - stage: Build
   displayName: Build & Push API Image
   jobs:
@@ -35,20 +41,19 @@ stages:
     - task: Docker@2
       displayName: Login Docker Hub
       inputs:
-        command: 'login'
-        containerRegistry: 'toDockerHub'       # 你的 DockerHub service connection
+        command: login
+        containerRegistry: 'toDockerHub'      # ←你的 DockerHub service connection
 
     - task: Docker@2
       displayName: Build+Push api:$(VERSION)
       inputs:
-        command: 'buildAndPush'
+        command: buildAndPush
         repository: '$(dockerHubRepo)'
         Dockerfile: '$(dockerfilePath)'
         buildContext: '$(buildContext)'
         tags: |
           $(VERSION)
 
-# ------------------- Release (bump kustomize & PR) -------------------
 - stage: Release
   displayName: Bump api tag in GitOps & open PR
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
@@ -59,35 +64,30 @@ stages:
     steps:
     - bash: |
         set -euo pipefail
-
-        # 工具
         sudo apt-get update -y
         sudo apt-get install -y jq
         curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
           -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
 
-        # 拉 GitOps 仓
         rm -rf configrepo
         git clone "https://${GITHUB_TOKEN}@github.com/${GITOPS_REPO}.git" configrepo
         cd configrepo
 
-        BR="bump-api-${VERSION}-${BUILD_BUILDID}"
+        BR="bump-api-$(VERSION)-${BUILD_BUILDID}"
         git checkout -b "$BR"
 
-        TARGET_DIR="${CONFIG_DIR}"
+        TARGET_DIR="$(CONFIG_DIR)"
         FILE="kustomization.yaml"
 
         echo "[info] repo root: $(pwd)"
         echo "[info] check dir: \"$TARGET_DIR\""
         ls -la "$TARGET_DIR" || { echo "[error] not found: $TARGET_DIR"; exit 1; }
 
-        # 关键：先进入目录再改（路径含 &）
         cd "$TARGET_DIR"
         echo "[info] patching: $(pwd)/$FILE"
         yq -i '(.images[] | select(.newName == env(IMG_NAME)).newTag) = env(VERSION)' "$FILE"
         cd - >/dev/null
 
-        # 没改动就退出
         if git diff --quiet -- "$TARGET_DIR/$FILE"; then
           echo "[info] nothing changed, skip."
           exit 0
@@ -96,11 +96,10 @@ stages:
         git config user.name  "ado-bot"
         git config user.email "ado-bot@example.com"
         git add "$TARGET_DIR/$FILE"
-        git commit -m "chore(api): bump to ${VERSION}"
+        git commit -m "chore(api): bump to $(VERSION)"
         git push -u origin "$BR"
 
-        # 开 PR
-        TITLE="chore(api): bump to ${VERSION}"
+        TITLE="chore(api): bump to $(VERSION)"
         PR=$(
           curl -sS -X POST "https://api.github.com/repos/${GITOPS_REPO}/pulls" \
             -H "Authorization: token ${GITHUB_TOKEN}" \
