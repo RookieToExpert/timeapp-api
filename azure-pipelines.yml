@@ -1,91 +1,87 @@
-# ==== 触发器 ====
-trigger:
-  branches:
-    include:
-    - main
-pr:
-  branches:
-    include:
-    - main
+trigger: { branches: { include: [ main ] } }
+pr:       { branches: { include: [ main ] } }
 
-# ==== 手动运行时可修改的入参（可选） ====
-parameters:
-- name: major               # 主版本（点击“Run pipeline”可改）
-  type: string
-  default: '1'
-- name: version             # 可选：手动指定完整版本（例如 2.7）；若留空则走自动计数
-  type: string
-  default: ''
-
-# ==== 变量 ====
 variables:
-  # 镜像、路径、K8s 对象
-  dockerHubRepo: 'rayrayye/timeapp-api-new'
-  dockerfilePath: 'Dockerfile'          # API 仓库里是大写 D
+  # 镜像（api）
+  apiRepo: 'docker.io/rayrayye/timeapp-api-new'
+  dockerfilePath: 'Dockerfile'
   buildContext: '.'
-  k8sServiceConnection: 'k8s-sc'
-  namespace: 'timeapp'
-  deployment: 'web-api'
-  container: 'api'
 
-  # 版本规则：默认【major + 自动 patch 递增】；也支持手动 version 覆盖
-  major: ${{ parameters.major }}
-  counterKey: 'api-${{ parameters.major }}'     # 每个 major 单独计数
+  # 配置仓（GitHub）
+  githubOrgRepo: 'RookieToExpert/az305'
+  configPath: 'kubernetes&docker/timeapp-config/overlays/prod'
+  configBranchPrefix: 'bump-api'
+
+  # 版本号（与 web 解耦的计数器）
+  major: '1'
+  counterKey: 'api-1'
   patch: $[ counter(variables['counterKey'], 0) ]
+  version: '$(major).$(patch)'
 
-  # 如果手动传入 version 就用它，否则用 major.patch
-  ${{ if ne(parameters.version, '') }}:
-    version: ${{ parameters.version }}
-  ${{ if eq(parameters.version, '') }}:
-    version: '$(major).$(patch)'
-
-# ==== 流水线 ====
 stages:
 - stage: Build
-  displayName: Build & Push API Image
+  displayName: Build & Push (api)
   jobs:
   - job: build
-    pool:
-      vmImage: 'ubuntu-latest'
+    pool: { vmImage: 'ubuntu-latest' }
     steps:
     - task: Docker@2
       displayName: Login Docker Hub
-      inputs:
-        command: login
-        containerRegistry: 'toDockerHub'   # 你的 Docker Hub service connection 名
+      inputs: { command: login, containerRegistry: 'toDockerHub' }
 
     - task: Docker@2
       displayName: Build+Push api:$(version)
       inputs:
         command: buildAndPush
-        repository: '$(dockerHubRepo)'
+        repository: '$(apiRepo)'
         Dockerfile: '$(dockerfilePath)'
         buildContext: '$(buildContext)'
         tags: |
           $(version)
 
-- stage: Deploy
-  displayName: Deploy API to K8s
+- stage: ConfigPR
+  displayName: 'Create PR to bump api tag (GitOps)'
   dependsOn: Build
   jobs:
-  - job: deploy
+  - job: pr
+    pool: { vmImage: 'ubuntu-latest' }
     steps:
-    - task: Kubernetes@1
-      displayName: Set image (web-api → $(version))
-      inputs:
-        connectionType: 'Kubernetes Service Connection'
-        kubernetesServiceEndpoint: '$(k8sServiceConnection)'
-        namespace: '$(namespace)'
-        command: 'set'
-        arguments: >
-          image deployment/$(deployment)
-          $(container)=docker.io/$(dockerHubRepo):$(version)
+    - script: |
+        set -eux
+        curl -L https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o /usr/local/bin/yq
+        chmod +x /usr/local/bin/yq
+        sudo apt-get update && sudo apt-get install -y gh
+      displayName: Install yq & gh
 
-    - task: Kubernetes@1
-      displayName: Wait rollout (web-api)
-      inputs:
-        connectionType: 'Kubernetes Service Connection'
-        kubernetesServiceEndpoint: '$(k8sServiceConnection)'
-        namespace: '$(namespace)'
-        command: 'rollout'
-        arguments: 'status deployment/$(deployment) --timeout=120s'
+    - script: |
+        set -eux
+        export GH_TOKEN="$(GITHUB_TOKEN)"
+        git config --global user.name  "ado-bot"
+        git config --global user.email "ado-bot@example.com"
+
+        git clone "https://github.com/$(githubOrgRepo).git" configrepo
+        cd configrepo
+
+        BR="$(configBranchPrefix)-$(version)-$(Build.BuildId)"
+        git checkout -b "$BR"
+
+        FILE="$(configPath)/kustomization.yaml"
+        export IMG_NAME="$(apiRepo)"
+        export VERSION="$(version)"
+        yq -i '(.images[] | select(.name == env(IMG_NAME))).newTag = env(VERSION)' "$FILE"
+
+        echo "After change:" && yq '.images' "$FILE"
+
+        git add "$FILE"
+        git commit -m "chore(api): bump to $(version)"
+        git push -u origin "$BR"
+
+        gh pr create \
+          --repo "$(githubOrgRepo)" \
+          --base main --head "$BR" \
+          --title "Bump api to $(version)" \
+          --body "Update api image tag to $(version) for GitOps" \
+          --label "gitops"
+      displayName: Bump api tag & open PR
+      env:
+        GITHUB_TOKEN: $(GITHUB_TOKEN)
