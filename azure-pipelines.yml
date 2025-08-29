@@ -1,114 +1,127 @@
-# azure-pipelines-api.yml
-trigger: { branches: { include: [ main ] } }
-pr:       { branches: { include: [ main ] } }
+trigger:
+  branches:
+    include: [ main ]
+pr:
+  branches:
+    include: [ main ]
 
 variables:
-  apiRepo: 'docker.io/rayrayye/timeapp-api-new'   # 注意 -new
+  dockerHubRepo: 'rayrayye/timeapp-api-new'
   dockerfilePath: 'Dockerfile'
   buildContext: '.'
-
-  githubOrgRepo: 'RookieToExpert/az305'
-  configPath: 'kubernetes&docker/timeapp-config/overlays/prod'
+  DOCKER_SERVICE_CONNECTION: 'toDockerHub'
 
   major: '1'
-  counterKey: 'api-1'
+  counterKey: 'timeapp-api-1'
   patch: $[ counter(variables['counterKey'], 0) ]
   version: '$(major).$(patch)'
 
+  GITHUB_REPO: 'RookieToExpert/az305'
+  IMG_NAME: 'docker.io/rayrayye/timeapp-api-new'
+
 stages:
 - stage: Build
-  displayName: Build & Push (api)
+  displayName: Build & Push api
   jobs:
   - job: build
-    pool: { vmImage: 'ubuntu-latest' }
+    pool:
+      vmImage: 'ubuntu-latest'
     steps:
     - task: Docker@2
       displayName: Login Docker Hub
-      inputs: { command: login, containerRegistry: 'toDockerHub' }
+      inputs:
+        command: login
+        containerRegistry: '$(DOCKER_SERVICE_CONNECTION)'
+
     - task: Docker@2
       displayName: Build+Push api:$(version)
       inputs:
         command: buildAndPush
-        repository: '$(apiRepo)'
+        repository: '$(dockerHubRepo)'
         Dockerfile: '$(dockerfilePath)'
         buildContext: '$(buildContext)'
         tags: |
           $(version)
 
-- stage: ConfigPR
-  displayName: Create PR (bump api tag)
+- stage: PR
+  displayName: Create PR to bump api tag (GitOps)
   dependsOn: Build
   jobs:
   - job: pr
-    pool: { vmImage: 'ubuntu-latest' }
+    pool:
+      vmImage: 'ubuntu-latest'
     steps:
-    - checkout: none
-
-    - script: |
+    - bash: |
         set -euo pipefail
-        curl -L https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o /usr/local/bin/yq
-        chmod +x /usr/local/bin/yq
-        sudo apt-get update -y && sudo apt-get install -y jq
-      displayName: Install yq & jq
+        sudo apt-get update -y
+        sudo apt-get install -y jq
+        YQ_VER="v4.44.3"
+        sudo curl -fsSL -o /usr/local/bin/yq \
+          "https://github.com/mikefarah/yq/releases/download/${YQ_VER}/yq_linux_amd64"
+        sudo chmod +x /usr/local/bin/yq
+      displayName: 'Install yq & jq'
 
-    - script: |
+    - bash: |
         set -euo pipefail
 
         git config --global user.name  "ado-bot"
         git config --global user.email "ado-bot@example.com"
 
-        # 1) 克隆配置仓（用 PAT）
         GIT_URL="https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
         git clone "$GIT_URL" configrepo
         cd configrepo
 
-        # 2) 新分支
-        BR="bump-api-${VERSION}-${BUILD_ID}"
+        BR="bump-api-$(version)-$(Build.BuildId)"
         git switch -c "$BR"
 
         echo "[info] searching kustomization.yaml …"
-        # 3) 自动搜：优先 overlays/prod
-        mapfile -t CANDIDATES < <(git ls-files | grep -E 'timeapp-config/.*/overlays/.*/kustomization\.yaml$' || true)
+        mapfile -t CANDIDATES < <(
+          git ls-files | grep -E 'timeapp-config(/.*)?/overlays(/.*)?/kustomization\.yaml$' || true
+        )
 
         if [ ${#CANDIDATES[@]} -eq 0 ]; then
           echo "[error] no kustomization.yaml found under timeapp-config/**/overlays/**"
-          echo "[hint] confirm your repo layout. Example expected: kubernetes&docker/timeapp-config/overlays/prod/kustomization.yaml"
+          echo "[hint] expected like: kubernetes&docker/timeapp-config/overlays/prod/kustomization.yaml"
           exit 1
         fi
 
-        echo "[info] candidates:"
-        printf ' - %s\n' "${CANDIDATES[@]}"
+        echo "[info] candidates:"; printf ' - %s\n' "${CANDIDATES[@]}"
 
-        # 选 /overlays/prod/ 这个，如果没有，就用第一个
         FILE=""
         for f in "${CANDIDATES[@]}"; do
-          if [[ "$f" =~ /overlays/prod/ ]]; then FILE="$f"; break; fi
+          [[ "$f" =~ /overlays/prod/ ]] && FILE="$f" && break
         done
-        if [ -z "$FILE" ]; then FILE="${CANDIDATES[0]}"; fi
-
+        [[ -z "$FILE" ]] && FILE="${CANDIDATES[0]}"
         echo "[info] using kustomization: $FILE"
 
-        # 4) 改 tag（确保 name 与 kustomization.yaml 的 images[].name 完全一致）
+        # 更新 api 镜像的 tag
         yq -i '(.images[] | select(.name == env(IMG_NAME))).newTag = env(VERSION)' "$FILE"
 
         git add "$FILE"
         if git diff --cached --quiet; then
-          echo "[info] nothing changed (maybe tag already ${VERSION})."
-        else
-          git commit -m "chore(api): bump to ${VERSION}"
-          git push -u origin "$BR"
-
-          # 5) 建 PR
-          RESP=$(curl -sS -X POST "https://api.github.com/repos/${GITHUB_REPO}/pulls" \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -d "{\"title\":\"Bump api to ${VERSION}\",\"body\":\"Update api image tag to ${VERSION} for GitOps\",\"head\":\"$BR\",\"base\":\"main\",\"maintainer_can_modify\":true}")
-          echo "[PR] $(echo "$RESP" | jq -r '.html_url')"
+          echo "[info] nothing changed (tag already ${VERSION})."
+          exit 0
         fi
+
+        git commit -m "chore(api): bump to ${VERSION}"
+        git push -u origin "$BR"
+
+        DATA=$(jq -n \
+          --arg title "Bump api to ${VERSION}" \
+          --arg body  "Update api image tag to ${VERSION} for GitOps" \
+          --arg head  "$BR" \
+          --arg base  "main" \
+          '{title:$title, body:$body, head:$head, base:$base}')
+
+        RESP=$(curl -sS -X POST "https://api.github.com/repos/${GITHUB_REPO}/pulls" \
+          -H "Authorization: token ${GITHUB_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          -d "$DATA")
+
+        echo "[PR] $(echo "$RESP" | jq -r '.html_url')"
       displayName: 'Bump api tag & open PR (auto-locate)'
       env:
-        GITHUB_TOKEN: $(GITHUB_TOKEN)          # 你在 DevOps Variable 里建的 Secret
-        GITHUB_REPO:  RookieToExpert/az305     # <owner>/<repo>
-        IMG_NAME:     docker.io/rayrayye/timeapp-api-new  # ← 必须与 kustomization.yaml 的 name 完全一致
-        VERSION:      $(version)               # 你前面 Build 阶段生成的版本号
-        BUILD_ID:     $(Build.BuildId)
+        GITHUB_TOKEN: $(GITHUB_TOKEN)
+        GITHUB_REPO:  $(GITHUB_REPO)
+        IMG_NAME:     $(IMG_NAME)
+        VERSION:      $(version)
