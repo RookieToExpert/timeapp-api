@@ -17,7 +17,7 @@ variables:
   version: '$(major).$(patch)'
 
   GITHUB_REPO: 'RookieToExpert/az305'
-  IMG_NAME: 'rayrayye/timeapp-api-new'   # 不带 docker.io 前缀，和 overlays/prod 里一致
+  IMG_NAME: 'rayrayye/timeapp-api-new'   # 与 overlays/prod 一致（不带 docker.io）
 
 stages:
 - stage: Build
@@ -40,12 +40,13 @@ stages:
         repository: '$(dockerHubRepo)'
         Dockerfile: '$(dockerfilePath)'
         buildContext: '$(buildContext)'
-        # 如果需要固定架构，可启用 buildArguments（Dockerfile/Agent 需支持 buildx）
+        # 如需限定架构可用（确保 Dockerfile/Agent 支持 buildx）：
         # buildArguments: |
         #   --platform=linux/amd64
         tags: |
           $(version)
-          # latest  # 如需推 latest，取消注释
+          # 如需 latest，请把下一行取消注释（注意：不要写行内注释）
+          # latest
 
 - stage: PR
   displayName: Create PR to bump api tag (GitOps)
@@ -98,9 +99,9 @@ stages:
         [[ -z "$FILE" ]] && FILE="${CANDIDATES[0]}"
         echo "[info] using kustomization: $FILE"
 
-        # 兼容 images.name / images.newName 两种写法，更新 api 的 tag
+        # 兼容 images.name / images.newName；images[]? 防止数组缺失时报错
         yq -i '
-          (.images[] | select(
+          (.images[]? | select(
               (.name == env(IMG_NAME)) or
               (.newName == env(IMG_NAME))
           )).newTag = env(VERSION)
