@@ -1,27 +1,21 @@
 trigger:
   branches:
-    include: [ main ]
+    include: [ main, feature/*, fix/* ]
 pr:
   branches:
-    include: [ main ]
+    include: [ main, feature/*, fix/* ]
 
 variables:
-  dockerHubRepo: 'rayrayye/timeapp-api-new'
-  dockerfilePath: 'Dockerfile'
-  buildContext: '.'
-  DOCKER_SERVICE_CONNECTION: 'toDockerHub'
-
+  dockerHubRepo: 'rayrayye/timeapp-api-new'    # ← API 镜像
+  kustomizeRepo: 'https://github.com/RookieToExpert/az305.git'
+  kustomizePath: 'kubernetes&docker/timeapp-config/overlays/prod/kustomization.yaml'
+  IMG_NAME: 'docker.io/rayrayye/timeapp-api-new'  # ← kustomization.yaml 里的 newName
+  counterKey: 'api-1'
   major: '1'
-  counterKey: 'timeapp-api-1'
-  patch: $[ counter(variables['counterKey'], 0) ]
-  version: '$(major).$(patch)'
-
-  GITHUB_REPO: 'RookieToExpert/az305'
-  IMG_NAME: 'docker.io/rayrayye/timeapp-api-new'
 
 stages:
 - stage: Build
-  displayName: Build & Push api
+  displayName: Build (api) & push SHA tag
   jobs:
   - job: build
     pool:
@@ -31,97 +25,77 @@ stages:
       displayName: Login Docker Hub
       inputs:
         command: login
-        containerRegistry: '$(DOCKER_SERVICE_CONNECTION)'
+        containerRegistry: 'toDockerHub'
 
-    - task: Docker@2
-      displayName: Build+Push api:$(version)
-      inputs:
-        command: buildAndPush
-        repository: '$(dockerHubRepo)'
-        Dockerfile: '$(dockerfilePath)'
-        buildContext: '$(buildContext)'
-        tags: |
-          $(version)
+    - bash: |
+        set -e
+        SHORT_SHA=$(echo $(Build.SourceVersion) | cut -c1-7)
+        echo "##vso[task.setvariable variable=SHORT_SHA;isOutput=true]$SHORT_SHA"
+        docker build -t $(dockerHubRepo):sha-$SHORT_SHA $(Build.SourcesDirectory)
+        docker push $(dockerHubRepo):sha-$SHORT_SHA
+      name: outvars
+      displayName: Build & push :sha-<short>
 
-- stage: PR
-  displayName: Create PR to bump api tag (GitOps)
+- stage: Release
+  displayName: Release (api only on main)
   dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  variables:
+    SHORT_SHA: $[ stageDependencies.Build.build.outputs['outvars.SHORT_SHA'] ]
+    patch: $[ counter(variables['counterKey'], 7) ]   # ← API 当前 1.7，写 7
+    VERSION: '$(major).$(patch)'
   jobs:
-  - job: pr
+  - job: release
     pool:
       vmImage: 'ubuntu-latest'
     steps:
+    - task: Docker@2
+      displayName: Login Docker Hub
+      inputs:
+        command: login
+        containerRegistry: 'toDockerHub'
+
     - bash: |
-        set -euo pipefail
+        set -e
+        docker pull $(dockerHubRepo):sha-$(SHORT_SHA)
+        docker tag  $(dockerHubRepo):sha-$(SHORT_SHA) $(dockerHubRepo):$(VERSION)
+        docker push $(dockerHubRepo):$(VERSION)
+      displayName: Tag SHA -> SemVer & push
+
+    - bash: |
+        set -e
         sudo apt-get update -y
         sudo apt-get install -y jq
-        YQ_VER="v4.44.3"
-        sudo curl -fsSL -o /usr/local/bin/yq \
-          "https://github.com/mikefarah/yq/releases/download/${YQ_VER}/yq_linux_amd64"
-        sudo chmod +x /usr/local/bin/yq
-      displayName: 'Install yq & jq'
+        curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+          -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
 
-    - bash: |
-        set -euo pipefail
-
-        git config --global user.name  "ado-bot"
-        git config --global user.email "ado-bot@example.com"
-
-        GIT_URL="https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
-        git clone "$GIT_URL" configrepo
+        rm -rf configrepo
+        git clone https://$(GITHUB_TOKEN)@github.com/RookieToExpert/az305.git configrepo
         cd configrepo
+        git checkout -b bump-api-$(VERSION)-$(Build.BuildId)
 
-        BR="bump-api-$(version)-$(Build.BuildId)"
-        git switch -c "$BR"
+        FILE="$(kustomizePath)"
+        yq -i '(.images[] | select(.newName == env(IMG_NAME)).newTag) = env(VERSION)' "$FILE"
 
-        echo "[info] searching kustomization.yaml …"
-        mapfile -t CANDIDATES < <(
-          git ls-files | grep -E 'timeapp-config(/.*)?/overlays(/.*)?/kustomization\.yaml$' || true
-        )
-
-        if [ ${#CANDIDATES[@]} -eq 0 ]; then
-          echo "[error] no kustomization.yaml found under timeapp-config/**/overlays/**"
-          echo "[hint] expected like: kubernetes&docker/timeapp-config/overlays/prod/kustomization.yaml"
-          exit 1
-        fi
-
-        echo "[info] candidates:"; printf ' - %s\n' "${CANDIDATES[@]}"
-
-        FILE=""
-        for f in "${CANDIDATES[@]}"; do
-          [[ "$f" =~ /overlays/prod/ ]] && FILE="$f" && break
-        done
-        [[ -z "$FILE" ]] && FILE="${CANDIDATES[0]}"
-        echo "[info] using kustomization: $FILE"
-
-        # 更新 api 镜像的 tag
-        yq -i '(.images[] | select(.name == env(IMG_NAME))).newTag = env(VERSION)' "$FILE"
-
-        git add "$FILE"
-        if git diff --cached --quiet; then
-          echo "[info] nothing changed (tag already ${VERSION})."
+        if git diff --quiet -- "$FILE"; then
+          echo "[info] nothing changed, skip."
           exit 0
         fi
 
-        git commit -m "chore(api): bump to ${VERSION}"
-        git push -u origin "$BR"
+        git config user.name  "ado-bot"
+        git config user.email "ado-bot@example.com"
+        git add "$FILE"
+        git commit -m "chore(api): bump to $(VERSION)"
+        git push -u origin HEAD
 
-        DATA=$(jq -n \
-          --arg title "Bump api to ${VERSION}" \
-          --arg body  "Update api image tag to ${VERSION} for GitOps" \
-          --arg head  "$BR" \
-          --arg base  "main" \
-          '{title:$title, body:$body, head:$head, base:$base}')
-
-        RESP=$(curl -sS -X POST "https://api.github.com/repos/${GITHUB_REPO}/pulls" \
+        TITLE="Bump api to $(VERSION)"
+        BODY="Auto bump from Azure DevOps"
+        REPO="RookieToExpert/az305"
+        PR=$(curl -sS -X POST "https://api.github.com/repos/$REPO/pulls" \
           -H "Authorization: token ${GITHUB_TOKEN}" \
           -H "Accept: application/vnd.github+json" \
-          -d "$DATA")
-
-        echo "[PR] $(echo "$RESP" | jq -r '.html_url')"
-      displayName: 'Bump api tag & open PR (auto-locate)'
+          -d "{\"title\":\"${TITLE}\",\"body\":\"${BODY}\",\"head\":\"$(git rev-parse --abbrev-ref HEAD)\",\"base\":\"main\"}")
+        echo "$PR" | jq -r '.html_url'
       env:
         GITHUB_TOKEN: $(GITHUB_TOKEN)
-        GITHUB_REPO:  $(GITHUB_REPO)
-        IMG_NAME:     $(IMG_NAME)
-        VERSION:      $(version)
+      displayName: Bump kustomize & open PR
