@@ -1,38 +1,27 @@
 trigger:
   branches:
     include: [ main ]
-
 pr:
   branches:
     include: [ main ]
 
 variables:
-- name: dockerHubRepo
-  value: 'rayrayye/timeapp-api-new'          # ←改成你的 API 仓库
-- name: dockerfilePath
-  value: 'Dockerfile'
-- name: buildContext
-  value: '.'
+  dockerHubRepo: 'rayrayye/timeapp-api-new'
+  dockerfilePath: 'Dockerfile'
+  buildContext: '.'
+  DOCKER_SERVICE_CONNECTION: 'toDockerHub'
 
-# 版本号：纯 runtime 表达式（不要混用 $(macro)）
-- name: major
-  value: '1'
-- name: counterKey
-  value: 'api-1'
-- name: VERSION
-  value: $[ format('{0}.{1}', variables['major'], counter(variables['counterKey'], 0)) ]
+  major: '1'
+  counterKey: 'timeapp-api-1'
+  patch: $[ counter(variables['counterKey'], 0) ]
+  version: '$(major).$(patch)'
 
-# GitOps 目标（注意含 &）
-- name: GITOPS_REPO
-  value: 'RookieToExpert/az305'              # ←改成你的 GitOps 仓库
-- name: CONFIG_DIR
-  value: 'kubernetes&docker/timeapp-config/overlays/prod'
-- name: IMG_NAME
-  value: 'docker.io/rayrayye/timeapp-api-new' # ←与 kustomization.yaml 中 newName 完全一致
+  GITHUB_REPO: 'RookieToExpert/az305'
+  IMG_NAME: 'docker.io/rayrayye/timeapp-api-new'
 
 stages:
 - stage: Build
-  displayName: Build & Push API Image
+  displayName: Build & Push api
   jobs:
   - job: build
     pool:
@@ -42,23 +31,23 @@ stages:
       displayName: Login Docker Hub
       inputs:
         command: login
-        containerRegistry: 'toDockerHub'      # ←你的 DockerHub service connection
+        containerRegistry: '$(DOCKER_SERVICE_CONNECTION)'
 
     - task: Docker@2
-      displayName: Build+Push api:$(VERSION)
+      displayName: Build+Push api:$(version)
       inputs:
         command: buildAndPush
         repository: '$(dockerHubRepo)'
         Dockerfile: '$(dockerfilePath)'
         buildContext: '$(buildContext)'
         tags: |
-          $(VERSION)
+          $(version)
 
-- stage: Release
-  displayName: Bump api tag in GitOps & open PR
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+- stage: PR
+  displayName: Create PR to bump api tag (GitOps)
+  dependsOn: Build
   jobs:
-  - job: bump
+  - job: pr
     pool:
       vmImage: 'ubuntu-latest'
     steps:
@@ -66,51 +55,73 @@ stages:
         set -euo pipefail
         sudo apt-get update -y
         sudo apt-get install -y jq
-        curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
-          -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+        YQ_VER="v4.44.3"
+        sudo curl -fsSL -o /usr/local/bin/yq \
+          "https://github.com/mikefarah/yq/releases/download/${YQ_VER}/yq_linux_amd64"
+        sudo chmod +x /usr/local/bin/yq
+      displayName: 'Install yq & jq'
 
-        rm -rf configrepo
-        git clone "https://${GITHUB_TOKEN}@github.com/${GITOPS_REPO}.git" configrepo
+    - bash: |
+        set -euo pipefail
+
+        git config --global user.name  "ado-bot"
+        git config --global user.email "ado-bot@example.com"
+
+        GIT_URL="https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+        git clone "$GIT_URL" configrepo
         cd configrepo
 
-        BR="bump-api-$(VERSION)-${BUILD_BUILDID}"
-        git checkout -b "$BR"
+        BR="bump-api-$(version)-$(Build.BuildId)"
+        git switch -c "$BR"
 
-        TARGET_DIR="$(CONFIG_DIR)"
-        FILE="kustomization.yaml"
+        echo "[info] searching kustomization.yaml …"
+        mapfile -t CANDIDATES < <(
+          git ls-files | grep -E 'timeapp-config(/.*)?/overlays(/.*)?/kustomization\.yaml$' || true
+        )
 
-        echo "[info] repo root: $(pwd)"
-        echo "[info] check dir: \"$TARGET_DIR\""
-        ls -la "$TARGET_DIR" || { echo "[error] not found: $TARGET_DIR"; exit 1; }
+        if [ ${#CANDIDATES[@]} -eq 0 ]; then
+          echo "[error] no kustomization.yaml found under timeapp-config/**/overlays/**"
+          echo "[hint] expected like: kubernetes&docker/timeapp-config/overlays/prod/kustomization.yaml"
+          exit 1
+        fi
 
-        cd "$TARGET_DIR"
-        echo "[info] patching: $(pwd)/$FILE"
-        yq -i '(.images[] | select(.newName == env(IMG_NAME)).newTag) = env(VERSION)' "$FILE"
-        cd - >/dev/null
+        echo "[info] candidates:"; printf ' - %s\n' "${CANDIDATES[@]}"
 
-        if git diff --quiet -- "$TARGET_DIR/$FILE"; then
-          echo "[info] nothing changed, skip."
+        FILE=""
+        for f in "${CANDIDATES[@]}"; do
+          [[ "$f" =~ /overlays/prod/ ]] && FILE="$f" && break
+        done
+        [[ -z "$FILE" ]] && FILE="${CANDIDATES[0]}"
+        echo "[info] using kustomization: $FILE"
+
+        # 更新 api 镜像的 tag
+        yq -i '(.images[] | select(.name == env(IMG_NAME))).newTag = env(VERSION)' "$FILE"
+
+        git add "$FILE"
+        if git diff --cached --quiet; then
+          echo "[info] nothing changed (tag already ${VERSION})."
           exit 0
         fi
 
-        git config user.name  "ado-bot"
-        git config user.email "ado-bot@example.com"
-        git add "$TARGET_DIR/$FILE"
-        git commit -m "chore(api): bump to $(VERSION)"
+        git commit -m "chore(api): bump to ${VERSION}"
         git push -u origin "$BR"
 
-        TITLE="chore(api): bump to $(VERSION)"
-        PR=$(
-          curl -sS -X POST "https://api.github.com/repos/${GITOPS_REPO}/pulls" \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -d "{\"title\":\"${TITLE}\",\"head\":\"${BR}\",\"base\":\"main\"}"
-        )
-        echo "$PR" | jq -r '.html_url'
-      displayName: Bump kustomize & open PR (api)
+        DATA=$(jq -n \
+          --arg title "Bump api to ${VERSION}" \
+          --arg body  "Update api image tag to ${VERSION} for GitOps" \
+          --arg head  "$BR" \
+          --arg base  "main" \
+          '{title:$title, body:$body, head:$head, base:$base}')
+
+        RESP=$(curl -sS -X POST "https://api.github.com/repos/${GITHUB_REPO}/pulls" \
+          -H "Authorization: token ${GITHUB_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          -d "$DATA")
+
+        echo "[PR] $(echo "$RESP" | jq -r '.html_url')"
+      displayName: 'Bump api tag & open PR (auto-locate)'
       env:
         GITHUB_TOKEN: $(GITHUB_TOKEN)
-        GITOPS_REPO: $(GITOPS_REPO)
-        CONFIG_DIR: $(CONFIG_DIR)
-        IMG_NAME: $(IMG_NAME)
-        VERSION: $(VERSION)
+        GITHUB_REPO:  $(GITHUB_REPO)
+        IMG_NAME:     $(IMG_NAME)
+        VERSION:      $(version)
