@@ -17,7 +17,7 @@ variables:
   version: '$(major).$(patch)'
 
   GITHUB_REPO: 'RookieToExpert/az305'
-  IMG_NAME: 'rayrayye/timeapp-api-new'   # 与 overlays/prod 一致（不带 docker.io）
+  IMG_NAME: 'rayrayye/timeapp-api-new'   # 与 overlays/prod 中 images 的 name/newName 一致（不带 docker.io）
 
 stages:
 - stage: Build
@@ -40,13 +40,11 @@ stages:
         repository: '$(dockerHubRepo)'
         Dockerfile: '$(dockerfilePath)'
         buildContext: '$(buildContext)'
-        # 如需限定架构可用（确保 Dockerfile/Agent 支持 buildx）：
+        # 如需限定架构再打开（要求 agent 支持 buildx）
         # buildArguments: |
         #   --platform=linux/amd64
         tags: |
           $(version)
-          # 如需 latest，请把下一行取消注释（注意：不要写行内注释）
-          # latest
 
 - stage: PR
   displayName: Create PR to bump api tag (GitOps)
@@ -68,7 +66,6 @@ stages:
 
     - bash: |
         set -euo pipefail
-
         git config --global user.name  "ado-bot"
         git config --global user.email "ado-bot@example.com"
 
@@ -83,13 +80,10 @@ stages:
         mapfile -t CANDIDATES < <(
           git ls-files | grep -E 'timeapp-config(/.*)?/overlays(/.*)?/kustomization\.yaml$' || true
         )
-
         if [ ${#CANDIDATES[@]} -eq 0 ]; then
           echo "[error] no kustomization.yaml found under timeapp-config/**/overlays/**"
-          echo "[hint] example: kubernetes-docker/timeapp-config/overlays/prod/kustomization.yaml"
           exit 1
         fi
-
         echo "[info] candidates:"; printf ' - %s\n' "${CANDIDATES[@]}"
 
         FILE=""
@@ -99,7 +93,7 @@ stages:
         [[ -z "$FILE" ]] && FILE="${CANDIDATES[0]}"
         echo "[info] using kustomization: $FILE"
 
-        # 兼容 images.name / images.newName；images[]? 防止数组缺失时报错
+        # 兼容 .images[].name / .images[].newName
         yq -i '
           (.images[]? | select(
               (.name == env(IMG_NAME)) or
