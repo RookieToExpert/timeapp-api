@@ -17,7 +17,7 @@ variables:
   version: '$(major).$(patch)'
 
   GITHUB_REPO: 'RookieToExpert/az305'
-  IMG_NAME: 'docker.io/rayrayye/timeapp-api-new'
+  IMG_NAME: 'rayrayye/timeapp-api-new'   # 不带 docker.io 前缀，和 overlays/prod 里一致
 
 stages:
 - stage: Build
@@ -40,8 +40,12 @@ stages:
         repository: '$(dockerHubRepo)'
         Dockerfile: '$(dockerfilePath)'
         buildContext: '$(buildContext)'
+        # 如果需要固定架构，可启用 buildArguments（Dockerfile/Agent 需支持 buildx）
+        # buildArguments: |
+        #   --platform=linux/amd64
         tags: |
           $(version)
+          # latest  # 如需推 latest，取消注释
 
 - stage: PR
   displayName: Create PR to bump api tag (GitOps)
@@ -81,7 +85,7 @@ stages:
 
         if [ ${#CANDIDATES[@]} -eq 0 ]; then
           echo "[error] no kustomization.yaml found under timeapp-config/**/overlays/**"
-          echo "[hint] expected like: kubernetes&docker/timeapp-config/overlays/prod/kustomization.yaml"
+          echo "[hint] example: kubernetes-docker/timeapp-config/overlays/prod/kustomization.yaml"
           exit 1
         fi
 
@@ -94,8 +98,13 @@ stages:
         [[ -z "$FILE" ]] && FILE="${CANDIDATES[0]}"
         echo "[info] using kustomization: $FILE"
 
-        # 更新 api 镜像的 tag
-        yq -i '(.images[] | select(.name == env(IMG_NAME))).newTag = env(VERSION)' "$FILE"
+        # 兼容 images.name / images.newName 两种写法，更新 api 的 tag
+        yq -i '
+          (.images[] | select(
+              (.name == env(IMG_NAME)) or
+              (.newName == env(IMG_NAME))
+          )).newTag = env(VERSION)
+        ' "$FILE"
 
         git add "$FILE"
         if git diff --cached --quiet; then
