@@ -48,8 +48,7 @@ stages:
         set -euo pipefail
         curl -L https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o /usr/local/bin/yq
         chmod +x /usr/local/bin/yq
-        sudo apt-get update -y
-        sudo apt-get install -y jq
+        sudo apt-get update -y && sudo apt-get install -y jq tree
       displayName: Install yq & jq
 
     - script: |
@@ -58,34 +57,51 @@ stages:
         git config --global user.name  "ado-bot"
         git config --global user.email "ado-bot@example.com"
 
+        # 1) 克隆配置仓（用 PAT；注意这里用 $GITHUB_TOKEN 而不是 $(...)）
         GIT_URL="https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
         git clone "$GIT_URL" configrepo
         cd configrepo
 
+        # 2) 新建分支
         BR="bump-api-${VERSION}-${BUILD_ID}"
         git switch -c "$BR"
 
+        # 3) 计算并校验文件路径
         FILE="${CONFIG_PATH}/kustomization.yaml"
-        yq -i '(.images[] | select(.name == env(IMG_NAME))).newTag = env(VERSION)' "$FILE"
 
-        git add "$FILE"
+        echo "Repo root: $(pwd)"
+        echo "Expect file: ${FILE}"
+        # 打印上两级目录结构帮助排错
+        echo "=== tree -L 3 ==="
+        tree -L 3 -F || true
+
+        # 显式校验文件是否存在；不存在就列出具体目录并退出
+        if [ ! -f "${FILE}" ]; then
+          echo "ERROR: ${FILE} not found."
+          echo "Listing directory of CONFIG_PATH parent:"
+          PARENT_DIR="$(dirname "${FILE}")"
+          ls -la "${PARENT_DIR}" || true
+          exit 1
+        fi
+
+        # 4) 修改 api 镜像 tag（注意 name 必须与 kustomization.yaml 里的完全一致）
+        yq -i '(.images[] | select(.name == env(IMG_NAME))).newTag = env(VERSION)' "${FILE}"
+
+        git add "${FILE}"
         git commit -m "chore(api): bump to ${VERSION}"
         git push -u origin "$BR"
 
+        # 5) 创建 PR 并打印链接
         RESP=$(curl -sS -X POST "https://api.github.com/repos/${GITHUB_REPO}/pulls" \
           -H "Authorization: token ${GITHUB_TOKEN}" \
           -H "Accept: application/vnd.github+json" \
           -d "{\"title\":\"Bump api to ${VERSION}\",\"body\":\"Update api image tag to ${VERSION} for GitOps\",\"head\":\"$BR\",\"base\":\"main\",\"maintainer_can_modify\":true}")
         echo "$RESP" | jq -r '.html_url'
-
-        # （可选）自动合并
-        # PR_NUM=$(echo "$RESP" | jq -r '.number')
-        # curl -sS -X PUT "https://api.github.com/repos/${GITHUB_REPO}/pulls/${PR_NUM}/merge" -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -d '{"merge_method":"merge"}'
-      displayName: 'Bump api tag & open PR'
+      displayName: 'Bump api tag & open PR (with path check)'
       env:
         GITHUB_TOKEN: $(GITHUB_TOKEN)
-        GITHUB_REPO: $(githubOrgRepo)
-        CONFIG_PATH: '$(configPath)'
-        IMG_NAME: '$(apiRepo)'                  # ← 与 kustomization.yaml 的 name 完全一致
+        GITHUB_REPO: RookieToExpert/az305
+        CONFIG_PATH: 'kubernetes&docker/timeapp-config/overlays/prod'
+        IMG_NAME: 'docker.io/rayrayye/timeapp-api-new'   # ← 与 kustomization.yaml 的 name 必须一致
         VERSION: $(version)
         BUILD_ID: $(Build.BuildId)
